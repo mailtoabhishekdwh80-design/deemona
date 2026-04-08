@@ -1,0 +1,544 @@
+# .github/workflows/ci.yml
+# ============================================================
+#  DEEMONA API — Main CI/CD Pipeline
+#
+#  Triggers:
+#    push  → main     : lint → test → build → deploy production
+#    push  → develop  : lint → test → build → deploy staging
+#    PR    → any      : lint → test (no deploy)
+#
+#  Jobs:
+#    1. lint       — ESLint + npm audit + .env guard
+#    2. test       — Jest against real SQL Server 2022 container
+#    3. build      — Multi-platform Docker image → GHCR
+#    4. deploy     — SSH to VPS  (Railway / Render stubs included)
+#    5. notify     — Slack on every outcome
+# ============================================================
+
+name: Deemona API — CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    branches: [main, develop]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+# Cancel in-flight runs for the same branch on new push
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  REGISTRY:     ghcr.io
+  IMAGE_NAME:   ${{ github.repository_owner }}/deemona-api
+
+# ─────────────────────────────────────────────────────────────
+# JOB 1 — Lint + Security Audit
+# ─────────────────────────────────────────────────────────────
+jobs:
+  lint:
+    name: Lint & Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint --if-present
+
+      # Block merges if HIGH or CRITICAL CVEs found in dependencies
+      - name: npm audit (security)
+        run: npm audit --audit-level=high
+        continue-on-error: true   # set to false once all deps are clean
+
+      # Catch accidental .env commits before they reach remote
+      - name: Guard against committed secrets
+        run: |
+          if git ls-files | grep -E '^\.env$|^\.env\.' | grep -v '\.env\.example'; then
+            echo "::error::.env file is tracked by git — remove it immediately"
+            exit 1
+          fi
+          echo "No .env files committed ✓"
+
+
+# ─────────────────────────────────────────────────────────────
+# JOB 2 — Test (real SQL Server 2022 service container)
+# ─────────────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 25
+
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA:       Y
+          MSSQL_SA_PASSWORD: TestPass@123456!
+          MSSQL_PID:         Developer
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'TestPass@123456!' -Q 'SELECT 1' -No -l 30"
+          --health-interval 15s
+          --health-timeout 15s
+          --health-retries 10
+          --health-start-period 90s
+
+    env:
+      NODE_ENV:           test
+      PORT:               3000
+      DB_SERVER:          localhost
+      DB_NAME:            DeemonaTestDB
+      DB_USER:            sa
+      DB_PASS:            TestPass@123456!
+      DB_PORT:            1433
+      DB_ENCRYPT:         "false"
+      DB_TRUST_CERT:      "true"
+      JWT_SECRET:         ci-access-secret-not-for-production
+      JWT_REFRESH_SECRET: ci-refresh-secret-not-for-production
+      JWT_ACCESS_TTL:     15m
+      DISABLE_JOBS:       "true"   # no cron in CI
+      EMAIL_FROM:         noreply@test.local
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for SQL Server
+        run: |
+          echo "Waiting for SQL Server to be ready..."
+          for i in $(seq 1 40); do
+            /opt/mssql-tools18/bin/sqlcmd \
+              -S localhost -U sa -P 'TestPass@123456!' \
+              -Q 'SELECT @@VERSION' -No -l 10 2>/dev/null && break
+            echo "  Attempt $i/40 — retrying in 5s"
+            sleep 5
+          done
+          echo "SQL Server is ready ✓"
+
+      - name: Create and migrate test database
+        run: |
+          /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost -U sa -P 'TestPass@123456!' \
+            -Q "IF DB_ID('DeemonaTestDB') IS NULL CREATE DATABASE DeemonaTestDB" \
+            -No
+
+          # Apply every migration in order — all are idempotent
+          for sql_file in database.sql migration.sql migration_v2.sql migration_v3.sql migration_v4.sql; do
+            if [ -f "$sql_file" ]; then
+              echo "  Applying $sql_file..."
+              /opt/mssql-tools18/bin/sqlcmd \
+                -S localhost -U sa -P 'TestPass@123456!' \
+                -d DeemonaTestDB -i "$sql_file" -No -b
+            fi
+          done
+          echo "Database ready ✓"
+
+      - name: Run Jest test suite
+        run: npm run test:coverage -- --reporters=default --reporters=jest-junit
+        env:
+          JEST_JUNIT_OUTPUT_DIR:  ./
+          JEST_JUNIT_OUTPUT_NAME: junit.xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: unittests
+          fail_ci_if_error: false
+
+      - name: Save coverage artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-${{ github.sha }}
+          path: coverage/
+          retention-days: 14
+
+      - name: Annotate PR with test failures
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name:     Jest Results
+          path:     junit.xml
+          reporter: jest-junit
+        continue-on-error: true
+
+
+# ─────────────────────────────────────────────────────────────
+# JOB 3 — Build multi-platform Docker image → GHCR
+# ─────────────────────────────────────────────────────────────
+  build:
+    name: Build & Push Docker
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'   # skip for PRs
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # needed for SBOM signing
+
+    outputs:
+      image-digest: ${{ steps.push.outputs.digest }}
+      image-tags:   ${{ steps.meta.outputs.tags }}
+      short-sha:    ${{ steps.sha.outputs.short }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU (for ARM builds)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=staging,enable=${{ github.ref == 'refs/heads/develop' }}
+          labels: |
+            org.opencontainers.image.title=Deemona E-Commerce API
+            org.opencontainers.image.description=Node.js/Express REST API with SQL Server
+            org.opencontainers.image.vendor=Deemona
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context:   .
+          target:    production
+          platforms: linux/amd64,linux/arm64
+          push:      true
+          tags:      ${{ steps.meta.outputs.tags }}
+          labels:    ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Print image digest
+        run: echo "Image pushed with digest ${{ steps.push.outputs.digest }}"
+
+
+# ─────────────────────────────────────────────────────────────
+# JOB 4a — Deploy to STAGING (develop branch)
+# ─────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    timeout-minutes: 15
+    environment:
+      name: staging
+      url:  ${{ secrets.STAGING_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── OPTION A: Railway (no server to manage) ───────────────
+      # 1. Install Railway CLI, set RAILWAY_TOKEN secret
+      # 2. Uncomment below, comment out Option C
+      #
+      # - name: Deploy to Railway staging
+      #   run: |
+      #     npm install -g @railway/cli
+      #     railway up --service deemona-api-staging --detach
+      #   env:
+      #     RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_STAGING }}
+
+      # ── OPTION B: Render.com (free tier available) ────────────
+      # 1. Create a Web Service on render.com pointing to your repo
+      # 2. Copy the Deploy Hook URL into RENDER_DEPLOY_HOOK_STAGING secret
+      # 3. Uncomment below, comment out Option C
+      #
+      # - name: Trigger Render staging deploy
+      #   run: |
+      #     curl --fail -X POST "${{ secrets.RENDER_DEPLOY_HOOK_STAGING }}"
+      #     echo "Render staging deploy triggered"
+
+      # ── OPTION C: SSH to VPS (active by default) ─────────────
+      # Secrets needed:
+      #   STAGING_HOST     — server IP or hostname
+      #   STAGING_USER     — SSH username (e.g. ubuntu)
+      #   STAGING_SSH_KEY  — private key (Settings → Secrets → Actions)
+      #   STAGING_URL      — https://staging.yourdomain.com
+      - name: Deploy to staging VPS via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key:      ${{ secrets.STAGING_SSH_KEY }}
+          port:     22
+          script: |
+            set -e
+            cd /var/www/deemona-staging
+
+            # Authenticate and pull new image
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+            export IMAGE_TAG="ghcr.io/${{ env.IMAGE_NAME }}:staging"
+            docker pull "$IMAGE_TAG"
+
+            # Swap container with zero-downtime
+            docker compose up -d --no-deps --pull always api
+
+            # Migrations are idempotent — safe to run every deploy
+            docker compose exec -T api node scripts/setupDb.js || true
+
+            # Remove images older than 24h
+            docker image prune -f --filter "until=24h"
+            echo "Staging deploy complete at $(date)"
+
+      - name: Staging smoke test
+        run: |
+          sleep 20
+          curl \
+            --fail --silent --max-time 15 \
+            "${{ secrets.STAGING_URL }}/api/health" | jq .
+          echo "Staging health check passed ✓"
+
+
+# ─────────────────────────────────────────────────────────────
+# JOB 4b — Deploy to PRODUCTION (main branch only)
+# ─────────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy → Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 20
+    environment:
+      name: production
+      url:  ${{ secrets.PRODUCTION_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── OPTION A: Railway production ─────────────────────────
+      # - name: Deploy to Railway production
+      #   run: |
+      #     npm install -g @railway/cli
+      #     railway up --service deemona-api --detach
+      #   env:
+      #     RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PROD }}
+
+      # ── OPTION B: Render production ───────────────────────────
+      # - name: Trigger Render production deploy
+      #   run: curl --fail -X POST "${{ secrets.RENDER_DEPLOY_HOOK_PROD }}"
+
+      # ── OPTION C: SSH to production VPS ─────────────────────
+      # Secrets needed (separate from staging):
+      #   PROD_HOST, PROD_USER, PROD_SSH_KEY, PRODUCTION_URL
+      - name: Deploy to production VPS via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key:      ${{ secrets.PROD_SSH_KEY }}
+          port:     22
+          script: |
+            set -e
+            cd /var/www/deemona
+
+            echo "── Pulling image sha-${{ needs.build.outputs.short-sha }} ──"
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+            export NEW_IMAGE="ghcr.io/${{ env.IMAGE_NAME }}:sha-${{ needs.build.outputs.short-sha }}"
+            docker pull "$NEW_IMAGE"
+
+            echo "── Running migrations before cutover ──"
+            # Run in a throwaway container — no traffic yet
+            docker run --rm \
+              --env-file /var/www/deemona/.env \
+              --add-host=host.docker.internal:host-gateway \
+              "$NEW_IMAGE" node scripts/setupDb.js
+
+            echo "── Updating compose and reloading ──"
+            # Write the pinned image tag so rollback is exact
+            echo "API_IMAGE=$NEW_IMAGE" > .image.env
+            docker compose --env-file .env --env-file .image.env \
+              up -d --no-deps api
+
+            echo "── Waiting for readiness ──"
+            sleep 10
+            for i in 1 2 3 4 5; do
+              STATUS=$(curl -sf http://localhost:3000/api/health \
+                         | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null)
+              [ "$STATUS" = "ok" ] && break
+              echo "  Health check $i/5 — waiting 5s"
+              sleep 5
+            done
+            [ "$STATUS" = "ok" ] || { echo "Health check failed"; exit 1; }
+
+            echo "── Cleanup ──"
+            docker image prune -f --filter "until=24h"
+            echo "Production deploy complete — $(date)"
+
+      - name: External health check
+        run: |
+          sleep 15
+          curl \
+            --fail --silent --retry 5 --retry-delay 5 --max-time 30 \
+            "${{ secrets.PRODUCTION_URL }}/api/health" | jq .
+          echo "Production health check passed ✓"
+
+      - name: Tag release on GitHub
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name:   "deploy-${{ needs.build.outputs.short-sha }}"
+          name:       "Deploy ${{ needs.build.outputs.short-sha }}"
+          body: |
+            **Image:** `ghcr.io/${{ env.IMAGE_NAME }}:sha-${{ needs.build.outputs.short-sha }}`
+            **Deployed:** ${{ github.event.head_commit.timestamp }}
+            **By:** ${{ github.actor }}
+
+            ${{ github.event.head_commit.message }}
+          prerelease: false
+        continue-on-error: true
+
+
+# ─────────────────────────────────────────────────────────────
+# JOB 5 — Slack Notification (always runs)
+# ─────────────────────────────────────────────────────────────
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [lint, test, build, deploy-staging, deploy-production]
+    if: always()
+    timeout-minutes: 5
+
+    steps:
+      - name: Build Slack payload
+        id: payload
+        run: |
+          LINT="${{ needs.lint.result }}"
+          TEST="${{ needs.test.result }}"
+          BUILD="${{ needs.build.result }}"
+          STAGING="${{ needs.deploy-staging.result }}"
+          PROD="${{ needs.deploy-production.result }}"
+
+          if [[ "$LINT,$TEST" == *"failure"* ]]; then
+            STATUS="failure"; EMOJI="🔴"; MSG="Build failed — lint or test error"
+          elif [[ "$BUILD" == "failure" ]]; then
+            STATUS="failure"; EMOJI="🔴"; MSG="Docker build failed"
+          elif [[ "$STAGING,$PROD" == *"failure"* ]]; then
+            STATUS="warning"; EMOJI="🟠"; MSG="Tests passed but deploy failed"
+          elif [[ "$LINT,$TEST,$BUILD" == *"cancelled"* ]]; then
+            STATUS="cancelled"; EMOJI="⚪"; MSG="Workflow cancelled"
+          else
+            STATUS="success"; EMOJI="✅"; MSG="All checks passed"
+          fi
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "emoji=$EMOJI"   >> $GITHUB_OUTPUT
+          echo "msg=$MSG"       >> $GITHUB_OUTPUT
+
+          # Branch label
+          REF="${{ github.ref_name }}"
+          if [ "$REF" = "main" ] && [ "$STATUS" = "success" ]; then
+            LABEL="🚀 Production"
+          elif [ "$REF" = "develop" ] && [ "$STATUS" = "success" ]; then
+            LABEL="🧪 Staging"
+          else
+            LABEL="$REF"
+          fi
+          echo "label=$LABEL" >> $GITHUB_OUTPUT
+
+      - name: Notify Slack
+        if: vars.SLACK_ENABLED == 'true'
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "attachments": [{
+                "color": "${{ steps.payload.outputs.status == 'success' && 'good' || steps.payload.outputs.status == 'warning' && 'warning' || 'danger' }}",
+                "blocks": [
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "${{ steps.payload.outputs.emoji }} *Deemona API — ${{ steps.payload.outputs.label }}*\n${{ steps.payload.outputs.msg }}"
+                    }
+                  },
+                  {
+                    "type": "section",
+                    "fields": [
+                      { "type": "mrkdwn", "text": "*Branch:*\n`${{ github.ref_name }}`" },
+                      { "type": "mrkdwn", "text": "*Actor:*\n${{ github.actor }}" },
+                      { "type": "mrkdwn", "text": "*Commit:*\n`${{ github.sha }}`" },
+                      { "type": "mrkdwn", "text": "*Message:*\n${{ github.event.head_commit.message }}" },
+                      { "type": "mrkdwn", "text": "*Lint:*\n${{ needs.lint.result }}" },
+                      { "type": "mrkdwn", "text": "*Tests:*\n${{ needs.test.result }}" }
+                    ]
+                  },
+                  {
+                    "type": "actions",
+                    "elements": [{
+                      "type": "button",
+                      "text": { "type": "plain_text", "text": "View Run →" },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }]
+                  }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        continue-on-error: true

@@ -1,0 +1,73 @@
+{
+  "name": "deemona-api",
+  "version": "1.0.0",
+  "description": "Deemona E-Commerce \u2014 Complete Backend API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js --watch routes --watch middleware --watch config --watch services",
+    "test": "jest --runInBand --forceExit",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --forceExit",
+    "lint": "eslint . --ext .js --ignore-path .eslintignore",
+    "lint:fix": "eslint . --ext .js --fix",
+    "setup-db": "node scripts/setupDb.js",
+    "seed": "node scripts/seedData.js",
+    "jobs:run": "node -e \"require('./services/jobs').start()\"",
+    "migrate": "node scripts/migrate.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "mysql2": "^3.6.5",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.9.7",
+    "qrcode": "^1.5.3",
+    "razorpay": "^2.9.2",
+    "speakeasy": "^2.0.0"
+  },
+  "optionalDependencies": {
+    "cloudinary": "^1.41.3",
+    "multer-storage-cloudinary": "^4.0.0",
+    "stripe": "^14.11.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.55.0",
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.2",
+    "supertest": "^6.3.3"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "**/tests/**/*.test.js"
+    ],
+    "testTimeout": 30000,
+    "setupFilesAfterFramework": [],
+    "coverageDirectory": "coverage",
+    "collectCoverageFrom": [
+      "routes/**/*.js",
+      "middleware/**/*.js",
+      "services/**/*.js",
+      "!**/node_modules/**"
+    ],
+    "coverageThresholds": {
+      "global": {
+        "lines": 60,
+        "functions": 60,
+        "branches": 50
+      }
+    }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

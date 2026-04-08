@@ -1,0 +1,8 @@
+﻿with open(r"C:\Deemona\Deemona_Frontend\deemona-frontend\src\components\ProductCard.jsx", "r", encoding="utf-8") as f:
+    lines = f.readlines()
+
+lines[118] = "              {adding ? 'Adding...' : inStock ? 'Add to Cart' : 'Unavailable'}\n"
+
+with open(r"C:\Deemona\Deemona_Frontend\deemona-frontend\src\components\ProductCard.jsx", "w", encoding="utf-8") as f:
+    f.writelines(lines)
+print("Fixed!")

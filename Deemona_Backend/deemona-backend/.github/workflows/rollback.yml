@@ -1,0 +1,140 @@
+# .github/workflows/rollback.yml
+# ============================================================
+#  DEEMONA API — Emergency Rollback
+#
+#  Trigger: manual only (workflow_dispatch)
+#  Purpose: revert production to any previous image tag
+#           without waiting for a full build/test cycle
+#
+#  Usage: GitHub UI → Actions → Rollback → Run workflow
+#         Input the SHA of the known-good commit
+# ============================================================
+
+name: Emergency Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: 'Short SHA to roll back to (e.g. abc1234). Find it in Releases.'
+        required: true
+        type: string
+      environment:
+        description: 'Environment to roll back'
+        required: true
+        default: production
+        type: choice
+        options:
+          - production
+          - staging
+      reason:
+        description: 'Reason for rollback (logged to Slack)'
+        required: true
+        type: string
+
+env:
+  IMAGE_NAME: ${{ github.repository_owner }}/deemona-api
+
+jobs:
+  rollback:
+    name: Rollback ${{ inputs.environment }} → sha-${{ inputs.target_sha }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Validate target image exists
+        run: |
+          IMAGE="ghcr.io/${{ env.IMAGE_NAME }}:sha-${{ inputs.target_sha }}"
+          echo "Checking image: $IMAGE"
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker manifest inspect "$IMAGE" || {
+            echo "::error::Image sha-${{ inputs.target_sha }} not found in registry"
+            exit 1
+          }
+          echo "Image exists ✓"
+
+      - name: Roll back production
+        if: inputs.environment == 'production'
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key:      ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            set -e
+            cd /var/www/deemona
+
+            echo "Rolling back to sha-${{ inputs.target_sha }}"
+            echo "Reason: ${{ inputs.reason }}"
+
+            # Record what was running (for audit)
+            PREVIOUS=$(cat .image.env 2>/dev/null || echo "unknown")
+            echo "PREV_IMAGE=$PREVIOUS" > .rollback-log
+
+            TARGET="ghcr.io/${{ env.IMAGE_NAME }}:sha-${{ inputs.target_sha }}"
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker pull "$TARGET"
+
+            echo "API_IMAGE=$TARGET" > .image.env
+            docker compose --env-file .env --env-file .image.env \
+              up -d --no-deps api
+
+            sleep 10
+            STATUS=$(curl -sf http://localhost:3000/api/health \
+                      | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null)
+            [ "$STATUS" = "ok" ] || { echo "Post-rollback health check failed"; exit 1; }
+
+            echo "Rollback complete — now running sha-${{ inputs.target_sha }}"
+
+      - name: Roll back staging
+        if: inputs.environment == 'staging'
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key:      ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            set -e
+            cd /var/www/deemona-staging
+            TARGET="ghcr.io/${{ env.IMAGE_NAME }}:sha-${{ inputs.target_sha }}"
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker pull "$TARGET"
+            echo "API_IMAGE=$TARGET" > .image.env
+            docker compose --env-file .env --env-file .image.env \
+              up -d --no-deps api
+            sleep 10
+            curl --fail "${{ secrets.STAGING_URL }}/api/health" | jq .status
+            echo "Staging rollback complete"
+
+      - name: Health check after rollback
+        run: |
+          URL="${{ inputs.environment == 'production' && secrets.PRODUCTION_URL || secrets.STAGING_URL }}"
+          sleep 15
+          curl --fail --silent --max-time 20 "$URL/api/health" | jq .
+          echo "Post-rollback health check passed ✓"
+
+      - name: Notify Slack of rollback
+        if: vars.SLACK_ENABLED == 'true'
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "attachments": [{
+                "color": "warning",
+                "blocks": [{
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "🔄 *Rollback executed* — ${{ inputs.environment }}\n*Target:* `sha-${{ inputs.target_sha }}`\n*By:* ${{ github.actor }}\n*Reason:* ${{ inputs.reason }}"
+                  }
+                }]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        continue-on-error: true

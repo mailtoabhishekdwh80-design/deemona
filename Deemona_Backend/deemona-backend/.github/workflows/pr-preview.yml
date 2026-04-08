@@ -1,0 +1,196 @@
+# .github/workflows/pr-preview.yml
+# ============================================================
+#  DEEMONA API — PR Preview Environments
+#
+#  Creates an ephemeral environment for every pull request:
+#    - PR opened / updated → spin up preview
+#    - PR closed / merged  → tear down preview
+#
+#  Each PR gets its own URL: https://pr-{number}.staging.yourdomain.com
+#
+#  Requirements:
+#    - Wildcard DNS: *.staging.yourdomain.com → staging server IP
+#    - Nginx on staging server configured with wildcard virtual host
+#    - STAGING_HOST, STAGING_USER, STAGING_SSH_KEY secrets
+# ============================================================
+
+name: PR Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [main, develop]
+
+env:
+  IMAGE_NAME: ${{ github.repository_owner }}/deemona-api
+
+jobs:
+
+# ─────────────────────────────────────────────────────────────
+# Spin up preview on PR open/update
+# ─────────────────────────────────────────────────────────────
+  deploy-preview:
+    name: Deploy PR Preview
+    runs-on: ubuntu-latest
+    if: github.event.action != 'closed'
+    timeout-minutes: 15
+    environment:
+      name: pr-preview-${{ github.event.pull_request.number }}
+      url:  https://pr-${{ github.event.pull_request.number }}.staging.${{ vars.BASE_DOMAIN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the PR image (amd64 only — faster than multi-platform)
+      - name: Build PR image
+        uses: docker/build-push-action@v5
+        with:
+          context:    .
+          target:     production
+          platforms:  linux/amd64
+          push:       true
+          tags:       ghcr.io/${{ env.IMAGE_NAME }}:pr-${{ github.event.pull_request.number }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Start preview environment
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key:      ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            set -e
+            PR=${{ github.event.pull_request.number }}
+            PORT=$((3100 + PR))
+            DIR="/var/www/deemona-pr-$PR"
+
+            mkdir -p "$DIR"
+
+            # Copy base .env from staging and override port
+            cp /var/www/deemona-staging/.env "$DIR/.env"
+            echo "PORT=$PORT"    >> "$DIR/.env"
+            echo "DB_NAME=DeemonaTestDB" >> "$DIR/.env"
+
+            # Write a minimal docker-compose for this PR
+            cat > "$DIR/docker-compose.yml" << COMPOSE
+            version: '3.9'
+            services:
+              api:
+                image: ghcr.io/${{ env.IMAGE_NAME }}:pr-$PR
+                restart: unless-stopped
+                ports:
+                  - "$PORT:$PORT"
+                env_file: .env
+                labels:
+                  - "traefik.enable=true"
+                  - "traefik.http.routers.pr-$PR.rule=Host(\`pr-$PR.${{ vars.BASE_DOMAIN }}\`)"
+            COMPOSE
+
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker compose -f "$DIR/docker-compose.yml" up -d --pull always
+
+            echo "Preview running on port $PORT"
+
+      - name: Comment preview URL on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request.number;
+            const url = `https://pr-${pr}.staging.${{ vars.BASE_DOMAIN }}`;
+            const body = [
+              `## 🔍 Preview Environment`,
+              ``,
+              `Your changes are live at: **${url}**`,
+              ``,
+              `| Endpoint | Link |`,
+              `|---|---|`,
+              `| Health check | [${url}/api/health](${url}/api/health) |`,
+              `| API docs | [${url}/api-docs](${url}/api-docs) |`,
+              ``,
+              `_Preview updates automatically on every push to this PR._`,
+              `_Preview is torn down when the PR is closed._`,
+            ].join('\n');
+
+            // Update existing comment instead of creating a new one each time
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: pr
+            });
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' && c.body.includes('Preview Environment')
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: pr, body
+              });
+            }
+
+
+# ─────────────────────────────────────────────────────────────
+# Tear down preview when PR is closed / merged
+# ─────────────────────────────────────────────────────────────
+  destroy-preview:
+    name: Destroy PR Preview
+    runs-on: ubuntu-latest
+    if: github.event.action == 'closed'
+    timeout-minutes: 10
+
+    steps:
+      - name: Stop and remove preview container
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key:      ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            PR=${{ github.event.pull_request.number }}
+            DIR="/var/www/deemona-pr-$PR"
+
+            if [ -d "$DIR" ]; then
+              docker compose -f "$DIR/docker-compose.yml" down --volumes || true
+              rm -rf "$DIR"
+              echo "Preview for PR #$PR destroyed"
+            else
+              echo "No preview found for PR #$PR"
+            fi
+
+            # Remove the PR image to free registry space
+            docker image rm \
+              "ghcr.io/${{ env.IMAGE_NAME }}:pr-$PR" 2>/dev/null || true
+
+      - name: Update PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: pr
+            });
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' && c.body.includes('Preview Environment')
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id,
+                body: `## 🔍 Preview Environment\n\nPreview torn down (PR closed).`
+              });
+            }

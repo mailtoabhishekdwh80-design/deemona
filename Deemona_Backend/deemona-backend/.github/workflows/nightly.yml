@@ -1,0 +1,225 @@
+# .github/workflows/nightly.yml
+# ============================================================
+#  DEEMONA API — Nightly Maintenance
+#
+#  Runs at 02:00 UTC every night
+#  Also manually triggerable
+#
+#  Jobs:
+#    1. dependency-audit  — check for new CVEs since last run
+#    2. db-backup         — dump SQL Server → compress → upload to storage
+#    3. stale             — close stale PRs/issues after 30 days
+# ============================================================
+
+name: Nightly Maintenance
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # 02:00 UTC = 07:30 IST
+  workflow_dispatch:
+    inputs:
+      run_backup:
+        description: 'Run DB backup'
+        type: boolean
+        default: true
+      run_audit:
+        description: 'Run security audit'
+        type: boolean
+        default: true
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+
+# ─────────────────────────────────────────────────────────────
+# JOB 1 — Dependency Security Audit
+# ─────────────────────────────────────────────────────────────
+  dependency-audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || inputs.run_audit == true
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit
+        id: audit
+        run: |
+          npm audit --json > audit-report.json 2>&1 || true
+          HIGH=$(cat audit-report.json | python3 -c "
+          import sys,json
+          d=json.load(sys.stdin)
+          v=d.get('metadata',{}).get('vulnerabilities',{})
+          print(v.get('high',0)+v.get('critical',0))
+          " 2>/dev/null || echo "0")
+          echo "high_count=$HIGH" >> $GITHUB_OUTPUT
+          echo "Found $HIGH high/critical vulnerabilities"
+          cat audit-report.json | python3 -m json.tool 2>/dev/null | head -100 || true
+
+      - name: Save audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-report-${{ github.run_number }}
+          path: audit-report.json
+          retention-days: 30
+
+      # Only alert on Slack if new HIGH/CRITICAL CVEs found
+      - name: Slack alert for vulnerabilities
+        if: steps.audit.outputs.high_count != '0' && vars.SLACK_ENABLED == 'true'
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "attachments": [{
+                "color": "danger",
+                "text": "🛡️ *Deemona API — Security Alert*\n${{ steps.audit.outputs.high_count }} high/critical vulnerabilities found.\nRun `npm audit fix` locally and open a PR.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View audit report>"
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        continue-on-error: true
+
+      # Open a GitHub Issue automatically if vulnerabilities found
+      - name: Open issue for vulnerabilities
+        if: steps.audit.outputs.high_count != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `[Security] ${${{ steps.audit.outputs.high_count }}} high/critical npm vulnerabilities found`;
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'security'
+            });
+            const already = issues.find(i => i.title === title);
+            if (!already) {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title,
+                body: `Nightly audit found vulnerabilities. Run \`npm audit\` locally for details.\n\nRun: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+                labels: ['security', 'dependencies']
+              });
+            }
+        continue-on-error: true
+
+
+# ─────────────────────────────────────────────────────────────
+# JOB 2 — Database Backup
+# ─────────────────────────────────────────────────────────────
+  db-backup:
+    name: Database Backup
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || inputs.run_backup == true
+    timeout-minutes: 30
+
+    steps:
+      - name: Create SQL Server backup and download
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key:      ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            set -e
+            BACKUP_DIR=/var/backups/deemona
+            mkdir -p "$BACKUP_DIR"
+            FILENAME="deemona-$(date +%Y%m%d-%H%M%S).bak"
+
+            # SQL Server backup inside the container
+            docker exec deemona-sqlserver \
+              /opt/mssql-tools18/bin/sqlcmd \
+              -S localhost -U sa -P "$MSSQL_SA_PASSWORD" \
+              -Q "BACKUP DATABASE DeemonaDB TO DISK='/tmp/$FILENAME' WITH COMPRESSION, STATS=10" \
+              -No
+
+            # Copy from container to host
+            docker cp "deemona-sqlserver:/tmp/$FILENAME" "$BACKUP_DIR/$FILENAME"
+
+            # Compress with gzip
+            gzip "$BACKUP_DIR/$FILENAME"
+            GZFILE="$BACKUP_DIR/$FILENAME.gz"
+            SIZE=$(du -sh "$GZFILE" | cut -f1)
+            echo "Backup created: $GZFILE ($SIZE)"
+
+            # Keep last 14 days only
+            find "$BACKUP_DIR" -name "*.bak.gz" -mtime +14 -delete
+            echo "Old backups pruned"
+
+      # ── Upload to object storage ──────────────────────────────
+      # Option A: AWS S3
+      # Requires: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_BACKUP_BUCKET secrets
+      #
+      # - name: Upload to S3
+      #   run: |
+      #     aws s3 cp \
+      #       "$BACKUP_FILE" \
+      #       "s3://${{ secrets.AWS_BACKUP_BUCKET }}/deemona/$(basename $BACKUP_FILE)" \
+      #       --storage-class STANDARD_IA
+      #   env:
+      #     AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+      #     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      #     AWS_DEFAULT_REGION:    ap-south-1
+
+      # Option B: Cloudflare R2 (S3-compatible, free egress)
+      # - name: Upload to Cloudflare R2
+      #   run: |
+      #     aws s3 cp "$BACKUP_FILE" "s3://${{ secrets.R2_BUCKET }}/$(basename $BACKUP_FILE)" \
+      #       --endpoint-url "https://${{ secrets.CF_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+      #   env:
+      #     AWS_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY }}
+      #     AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
+
+      - name: Backup complete notification
+        if: vars.SLACK_ENABLED == 'true'
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "💾 *Deemona DB backup complete* — $(date +%Y-%m-%d)"
+            }
+        env:
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        continue-on-error: true
+
+
+# ─────────────────────────────────────────────────────────────
+# JOB 3 — Stale Issue / PR Cleanup
+# ─────────────────────────────────────────────────────────────
+  stale:
+    name: Close Stale Issues & PRs
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/stale@v9
+        with:
+          repo-token:               ${{ secrets.GITHUB_TOKEN }}
+          stale-issue-message:      |
+            This issue has been inactive for 30 days. It will be closed in 7 days unless there is new activity.
+          stale-pr-message:         |
+            This PR has been inactive for 30 days. It will be closed in 7 days unless updated.
+          close-issue-message:      |
+            Closed due to 37 days of inactivity. Reopen if still relevant.
+          close-pr-message:         |
+            Closed due to 37 days of inactivity. Reopen if you want to continue.
+          days-before-stale:        30
+          days-before-close:        7
+          stale-issue-label:        stale
+          stale-pr-label:           stale
+          exempt-issue-labels:      'pinned,security,bug'
+          exempt-pr-labels:         'do-not-merge'
+          operations-per-run:       50

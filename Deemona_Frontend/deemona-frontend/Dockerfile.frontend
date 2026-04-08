@@ -1,0 +1,19 @@
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install --legacy-peer-deps
+
+COPY . .
+
+RUN echo "VITE_API_URL=/api" > .env
+RUN echo "VITE_RAZORPAY_KEY_ID=rzp_test_placeholder" >> .env
+
+ENV NODE_OPTIONS=--max-old-space-size=2048
+
+RUN npm run build
+
+FROM nginx:1.25-alpine
+COPY --from=builder /app/dist /var/www/frontend
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]

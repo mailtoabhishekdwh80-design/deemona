@@ -1,0 +1,102 @@
+﻿version: '3.9'
+
+# ============================================================
+#  Deemona MySQL Stack
+#  Services: api (Node.js) + mysql (MySQL 8) + nginx
+#  Usage:
+#    docker compose up -d --build
+#    docker compose logs -f
+# ============================================================
+
+services:
+
+  mysql:
+    image: mysql:8.0
+    container_name: deemona-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: DeemonaLocal123
+      MYSQL_DATABASE:      deemona
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./Deemona_Backend/deemona-backend/migration.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "3306:3306"
+    networks:
+      - deemona-net
+    healthcheck:
+      test:     ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "--password=DeemonaLocal123"]
+      interval: 15s
+      timeout:  10s
+      retries:  8
+      start_period: 40s
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-authentication-plugin=mysql_native_password
+
+  api:
+    build:
+      context:    ./Deemona_Backend/deemona-backend
+      dockerfile: Dockerfile
+    container_name: deemona-api
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV:  production
+      PORT:      3000
+      DB_SERVER: mysql
+      DB_PORT:   3306
+      DB_NAME:   deemona
+      DB_USER:   root
+      DB_PASS:   DeemonaLocal123
+    volumes:
+      - uploads_data:/app/public/uploads
+    networks:
+      - deemona-net
+    healthcheck:
+      test:     ["CMD", "node", "-e", "require('http').get('http://localhost:3000/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout:  10s
+      start_period: 30s
+      retries:  5
+
+  frontend:
+    build:
+      context:    ./Deemona_Frontend/deemona-frontend
+      dockerfile: Dockerfile.frontend
+    container_name: deemona-frontend
+    restart: unless-stopped
+    volumes:
+      - frontend_dist:/var/www/frontend
+    networks:
+      - deemona-net
+
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: deemona-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+      - frontend
+    volumes:
+      - ./Deemona_Backend/deemona-backend/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - frontend_dist:/var/www/frontend:ro
+      - uploads_data:/var/www/uploads/products:ro
+    networks:
+      - deemona-net
+
+volumes:
+  mysql_data:
+    name: deemona_mysql_data
+  uploads_data:
+    name: deemona_uploads
+  frontend_dist:
+    name: deemona_frontend_dist
+
+networks:
+  deemona-net:
+    name: deemona_network
+    driver: bridge

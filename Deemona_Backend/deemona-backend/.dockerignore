@@ -1,0 +1,39 @@
+# .dockerignore — keeps Docker build context small and secure
+node_modules/
+npm-debug.log*
+
+# Tests & dev
+tests/
+coverage/
+*.test.js
+*.spec.js
+
+# Local env — NEVER bake secrets into image
+.env
+.env.*
+!.env.example
+
+# Dev tooling
+.eslintrc*
+.prettierrc*
+nodemon.json
+
+# Git & CI
+.git/
+.github/
+.gitignore
+
+# Docs
+*.md
+docs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Local uploads (use volumes in production)
+public/uploads/

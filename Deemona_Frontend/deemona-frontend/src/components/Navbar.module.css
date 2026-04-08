@@ -1,0 +1,10 @@
+/* Navbar.module.css — responsive helpers */
+.hideOnMobile {
+  display: flex;
+}
+
+@media (max-width: 768px) {
+  .hideOnMobile {
+    display: none;
+  }
+}
